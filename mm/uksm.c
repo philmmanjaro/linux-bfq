@@ -46,8 +46,10 @@
 #include <linux/mm.h>
 #include <linux/fs.h>
 #include <linux/mman.h>
+#include <linux/sched.h>
+#include <linux/sched/mm.h>
+#include <linux/sched/coredump.h>
 #include <linux/sched/cputime.h>
-#include <linux/sched/signal.h>
 #include <linux/rwsem.h>
 #include <linux/pagemap.h>
 #include <linux/rmap.h>
@@ -69,6 +71,8 @@
 #include <linux/math64.h>
 #include <linux/gcd.h>
 #include <linux/freezer.h>
+#include <linux/oom.h>
+#include <linux/numa.h>
 #include <linux/sradix-tree.h>
 
 #include <asm/tlbflush.h>
@@ -1508,7 +1512,8 @@ static int write_protect_page(struct vm_area_struct *vma, struct page *page,
 	if (old_pte)
 		*old_pte = *pvmw.pte;
 
-	if (pte_write(*pvmw.pte) || pte_dirty(*pvmw.pte)) {
+	if (pte_write(*pvmw.pte) || pte_dirty(*pvmw.pte) ||
+	    (pte_protnone(*pvmw.pte) && pte_savedwrite(*pvmw.pte))) {
 		pte_t entry;
 
 		swapped = PageSwapCache(page);
@@ -1533,7 +1538,12 @@ static int write_protect_page(struct vm_area_struct *vma, struct page *page,
 		}
 		if (pte_dirty(entry))
 			set_page_dirty(page);
-		entry = pte_mkclean(pte_wrprotect(entry));
+
+		if (pte_protnone(entry))
+			entry = pte_mkclean(pte_clear_savedwrite(entry));
+		else
+			entry = pte_mkclean(pte_wrprotect(entry));
+
 		set_pte_at_notify(mm, pvmw.address, pvmw.pte, entry);
 	}
 	*orig_pte = *pvmw.pte;
@@ -2068,9 +2078,10 @@ static int try_merge_rmap_item(struct rmap_item *item,
 			       struct page *kpage,
 			       struct page *tree_page)
 {
+	struct vm_area_struct *vma = item->slot->vma;
 	struct page_vma_mapped_walk pvmw = {
 		.page = kpage,
-		.vma = item->slot->vma,
+		.vma = vma,
 	};
 
 	pvmw.address = get_rmap_addr(item);
@@ -2084,12 +2095,12 @@ static int try_merge_rmap_item(struct rmap_item *item,
 	}
 
 	get_page(tree_page);
-	page_add_anon_rmap(tree_page, pvmw.vma, pvmw.address, false);
+	page_add_anon_rmap(tree_page, vma, pvmw.address, false);
 
-	flush_cache_page(pvmw.vma, pvmw.address, pte_pfn(*pvmw.pte));
-	ptep_clear_flush_notify(pvmw.vma, pvmw.address, pvmw.pte);
-	set_pte_at_notify(pvmw.vma->vm_mm, pvmw.address, pvmw.pte,
-			  mk_pte(tree_page, pvmw.vma->vm_page_prot));
+	flush_cache_page(vma, pvmw.address, page_to_pfn(kpage));
+	ptep_clear_flush_notify(vma, pvmw.address, pvmw.pte);
+	set_pte_at_notify(vma->vm_mm, pvmw.address, pvmw.pte,
+			  mk_pte(tree_page, vma->vm_page_prot));
 
 	page_remove_rmap(kpage, false);
 	put_page(kpage);
