@@ -1577,6 +1577,7 @@ static int replace_page(struct vm_area_struct *vma, struct page *page,
 {
 	struct mm_struct *mm = vma->vm_mm;
 	pgd_t *pgd;
+	p4d_t *p4d;
 	pud_t *pud;
 	pmd_t *pmd;
 	pte_t *ptep;
@@ -1596,7 +1597,8 @@ static int replace_page(struct vm_area_struct *vma, struct page *page,
 	if (!pgd_present(*pgd))
 		goto out;
 
-	pud = pud_offset(pgd, addr);
+	p4d = p4d_offset(pgd, addr);
+	pud = pud_offset(p4d, addr);
 	if (!pud_present(*pud))
 		goto out;
 
@@ -1796,6 +1798,7 @@ static int restore_uksm_page_pte(struct vm_area_struct *vma, unsigned long addr,
 {
 	struct mm_struct *mm = vma->vm_mm;
 	pgd_t *pgd;
+	p4d_t *p4d;
 	pud_t *pud;
 	pmd_t *pmd;
 	pte_t *ptep;
@@ -1807,7 +1810,8 @@ static int restore_uksm_page_pte(struct vm_area_struct *vma, unsigned long addr,
 	if (!pgd_present(*pgd))
 		goto out;
 
-	pud = pud_offset(pgd, addr);
+	p4d = p4d_offset(pgd, addr);
+	pud = pud_offset(p4d, addr);
 	if (!pud_present(*pud))
 		goto out;
 
@@ -4701,12 +4705,11 @@ static int uksm_scan_thread(void *nothing)
 	return 0;
 }
 
-int rmap_walk_ksm(struct page *page, struct rmap_walk_control *rwc)
+void rmap_walk_ksm(struct page *page, struct rmap_walk_control *rwc)
 {
 	struct stable_node *stable_node;
 	struct node_vma *node_vma;
 	struct rmap_item *rmap_item;
-	int ret = SWAP_AGAIN;
 	int search_new_forks = 0;
 	unsigned long address;
 
@@ -4715,7 +4718,7 @@ int rmap_walk_ksm(struct page *page, struct rmap_walk_control *rwc)
 
 	stable_node = page_stable_node(page);
 	if (!stable_node)
-		return ret;
+		return;
 again:
 	hlist_for_each_entry(node_vma, &stable_node->hlist, hlist) {
 		hlist_for_each_entry(rmap_item, &node_vma->rmap_hlist, hlist) {
@@ -4742,15 +4745,14 @@ again:
 				if (rwc->invalid_vma && rwc->invalid_vma(vma, rwc->arg))
 					continue;
 
-				ret = rwc->rmap_one(page, vma, address, rwc->arg);
-				if (ret != SWAP_AGAIN) {
+				if (!rwc->rmap_one(page, vma, address, rwc->arg)) {
 					anon_vma_unlock_read(anon_vma);
-					goto out;
+					return;
 				}
 
 				if (rwc->done && rwc->done(page)) {
 					anon_vma_unlock_read(anon_vma);
-					goto out;
+					return;
 				}
 			}
 			anon_vma_unlock_read(anon_vma);
@@ -4758,8 +4760,6 @@ again:
 	}
 	if (!search_new_forks++)
 		goto again;
-out:
-	return ret;
 }
 
 #ifdef CONFIG_MIGRATION
