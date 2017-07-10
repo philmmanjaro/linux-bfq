@@ -90,7 +90,7 @@ enum {
 
 void print_scheduler_version(void)
 {
-	printk(KERN_INFO "BFS enhancement patchset VRQ 0.96c by Alfred Chen.\n");
+	printk(KERN_INFO "BFS enhancement patchset VRQ 0.96d by Alfred Chen.\n");
 }
 
 /* task_struct::on_rq states: */
@@ -221,11 +221,6 @@ struct rq *uprq;
 #ifndef finish_arch_post_lock_switch
 # define finish_arch_post_lock_switch()	do { } while (0)
 #endif
-
-static inline bool task_running(struct task_struct *p)
-{
-	return p->on_cpu;
-}
 
 /**
  * A task that is not running or queued will not have a node set.
@@ -1226,6 +1221,43 @@ void set_task_cpu(struct task_struct *p, unsigned int cpu)
  */
 
 /*
+ * detach_task() -- detach the task for the migration specified in @target_cpu
+ */
+static void detach_task(struct rq *rq, struct task_struct *p, int target_cpu)
+{
+	lockdep_assert_held(&rq->lock);
+
+	p->on_rq = TASK_ON_RQ_MIGRATING;
+	if (task_contributes_to_load(p))
+		rq->nr_uninterruptible++;
+	dequeue_task(p, rq);
+	rq->nr_running--;
+
+	set_task_cpu(p, target_cpu);
+}
+
+/*
+ * attach_task() -- attach the task detached by detach_task() to its new rq.
+ */
+static void attach_task(struct rq *rq, struct task_struct *p)
+{
+	lockdep_assert_held(&rq->lock);
+
+	BUG_ON(task_rq(p) != rq);
+
+	update_rq_clock(rq);
+
+	if (task_contributes_to_load(p))
+		rq->nr_uninterruptible--;
+	enqueue_task(p, rq);
+	rq->nr_running++;
+	p->on_rq = TASK_ON_RQ_QUEUED;
+	cpufreq_update_this_cpu(rq, 0);
+
+	check_preempt_curr(rq, p);
+}
+
+/*
  * move_queued_task - move a queued task to new rq.
  *
  * Returns (locked) new rq. Old rq's lock is released.
@@ -1233,25 +1265,21 @@ void set_task_cpu(struct task_struct *p, unsigned int cpu)
 static struct rq *move_queued_task(struct rq *rq, struct task_struct *p, int
 				   new_cpu)
 {
-	lockdep_assert_held(&rq->lock);
-
-	p->on_rq = TASK_ON_RQ_MIGRATING;
-	dequeue_task(p, rq);
-	rq->nr_running--;
-	set_task_cpu(p, new_cpu);
+	detach_task(rq, p, new_cpu);
 	raw_spin_unlock(&rq->lock);
 
 	rq = cpu_rq(new_cpu);
 
 	raw_spin_lock(&rq->lock);
-	BUG_ON(task_cpu(p) != new_cpu);
-	enqueue_task(p, rq);
-	rq->nr_running++;
-	p->on_rq = TASK_ON_RQ_QUEUED;
-	check_preempt_curr(rq, p);
+	attach_task(rq, p);
 
 	return rq;
 }
+
+struct migration_arg {
+	struct task_struct *task;
+	int dest_cpu;
+};
 
 /*
  * Move (not current) task off this CPU, onto the destination CPU. We're doing
@@ -1274,11 +1302,6 @@ static struct rq *__migrate_task(struct rq *rq, struct task_struct *p, int
 
 	return move_queued_task(rq, p, dest_cpu);
 }
-
-struct migration_arg {
-	struct task_struct *task;
-	int dest_cpu;
-};
 
 /*
  * migration_cpu_stop - this will be executed by a highprio stopper thread
@@ -2882,100 +2905,31 @@ static inline void vrq_scheduler_task_tick(struct rq *rq)
 #ifdef CONFIG_SMP
 
 #ifdef CONFIG_SCHED_SMT
-/*
- * detach_task() -- detach the task for the migration specified in @target_cpu
- */
-static void detach_task(struct rq *rq, struct task_struct *p, int target_cpu)
-{
-	lockdep_assert_held(&rq->lock);
-
-	if (task_contributes_to_load(p))
-		rq->nr_uninterruptible++;
-	dequeue_task(p, rq);
-	rq->nr_running--;
-	p->on_rq = TASK_ON_RQ_MIGRATING;
-	cpufreq_update_this_cpu(rq, 0);
-
-	set_task_cpu(p, target_cpu);
-}
-
-/*
- * attach_task() -- attach the task detached by detach_task() to its new rq.
- */
-static void attach_task(struct rq *rq, struct task_struct *p)
-{
-	lockdep_assert_held(&rq->lock);
-
-	BUG_ON(task_rq(p) != rq);
-
-	update_rq_clock(rq);
-
-	if (task_contributes_to_load(p))
-		rq->nr_uninterruptible--;
-	enqueue_task(p, rq);
-	rq->nr_running++;
-	p->on_rq = TASK_ON_RQ_QUEUED;
-	cpufreq_update_this_cpu(rq, 0);
-
-	check_preempt_curr(rq, p);
-}
-
-/*
- * attach_one_task() -- attaches the task returned from detach_one_task() to
- * its new rq.
- */
-static void attach_one_task(struct rq *rq, struct task_struct *p)
-{
-	raw_spin_lock(&rq->lock);
-	attach_task(rq, p);
-	raw_spin_unlock(&rq->lock);
-}
-
 static int active_load_balance_cpu_stop(void *data)
 {
-	struct rq *rq = data;
+	struct rq *rq = this_rq();
+	struct task_struct *p = data;
+	cpumask_t tmp;
 	unsigned long flags;
-	struct task_struct *p;
-	int target_cpu = rq->push_cpu;
-	bool migration = false;
 
 	local_irq_save(flags);
 
-	raw_spin_lock(&rq->lock);
-
-	p = rq_first_queued_task(rq);
-	if (unlikely(NULL == p))
-		goto unlock_out;
-
-	if (unlikely(!cpumask_test_cpu(target_cpu, &p->cpus_allowed))) {
-		p = NULL;
-		goto unlock_out;
-	}
-
-	raw_spin_unlock(&rq->lock);
 	raw_spin_lock(&p->pi_lock);
 	raw_spin_lock(&rq->lock);
 
 	/*
 	 * _something_ may have changed the task, double check again
 	 */
-	if (likely(rq_first_queued_task(rq) == p &&
-		   rq == task_rq(p) &&
-		   cpumask_test_cpu(target_cpu, &p->cpus_allowed))) {
-		detach_task(rq, p, target_cpu);
-		migration = true;
-	}
+	if (task_queued(p) &&
+	    task_rq(p) == rq &&
+	    cpumask_and(&tmp, &p->cpus_allowed, &sched_cpu_sg_idle_mask) &&
+	    cpumask_and(&tmp, &tmp, cpu_active_mask))
+		rq = __migrate_task(rq, p, cpumask_any(&tmp));
 
-unlock_out:
 	rq->active_balance = 0;
-	raw_spin_unlock(&rq->lock);
 
-	if (migration) {
-		struct rq *target_rq = cpu_rq(target_cpu);
-		attach_one_task(target_rq, p);
-	}
-	if (p)
-		raw_spin_unlock(&p->pi_lock);
+	raw_spin_unlock(&rq->lock);
+	raw_spin_unlock(&p->pi_lock);
 
 	local_irq_restore(flags);
 
@@ -2997,7 +2951,6 @@ static __latent_entropy void vrq_run_rebalance(struct softirq_action *h)
 
 		if (likely(!this_rq->active_balance)) {
 			this_rq->active_balance = 1;
-			this_rq->push_cpu = cpumask_any(&tmp);
 			active_balance = 1;
 		}
 
@@ -3005,7 +2958,7 @@ static __latent_entropy void vrq_run_rebalance(struct softirq_action *h)
 
 		if (likely(active_balance))
 			stop_one_cpu_nowait(cpu_of(this_rq),
-					    active_load_balance_cpu_stop, this_rq,
+					    active_load_balance_cpu_stop, curr,
 					    &this_rq->active_balance_work);
 	} else
 		raw_spin_unlock_irqrestore(&this_rq->lock, flags);
