@@ -65,7 +65,6 @@ struct rq {
 
 #ifdef CONFIG_SCHED_SMT
 	int active_balance;
-	int push_cpu;
 	struct cpu_stop_work active_balance_work;
 #endif
 #endif /* CONFIG_SMP */
@@ -197,6 +196,10 @@ task_access_unlock_irqrestore(struct task_struct *p, raw_spinlock_t *lock,
 	raw_spin_unlock_irqrestore(lock, *flags);
 }
 
+static inline bool task_running(struct task_struct *p)
+{
+	return p->on_cpu;
+}
 
 #include "stats.h"
 
