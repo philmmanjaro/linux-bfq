@@ -49,7 +49,6 @@ struct rq {
 	struct mm_struct *prev_mm;
 
 	struct skiplist_node sl_header;
-	unsigned int nr_queued; /* number of tasks in skip list */
 
 	/* switch count */
 	u64 nr_switches;
@@ -84,13 +83,13 @@ struct rq {
 
 	u64 clock, last_tick;
 	u64 clock_task;
+	u64 last_switch;
 	int dither;
 
 	unsigned long nr_running;
 	unsigned long nr_uninterruptible;
 
-	int last_tagged_queued_level;
-	int last_running_policy_level;
+	int queued_level;
 
 #ifdef CONFIG_SCHED_HRTICK
 #ifdef CONFIG_SMP
